@@ -1,5 +1,6 @@
 # fMRI Network Analysis in Post-Surgical Pain: Investigating the Role of Spinal GABAergic Circuits
 Final Project for EN.580.474 Introduction to Neuro-Image Processing
+
 Sidharth Raghavan and Linika Goel
 
 # Dataset Details:
