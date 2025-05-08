@@ -1,5 +1,5 @@
 '''
-Manual ICA Implementation
+Manual ICA Implementation with Proper Whitening and Masking
 Introduction to Neuro-Image Processing Final Project
 Sidharth Raghavan
 '''
@@ -86,6 +86,228 @@ def load_atlas():
     except Exception as e:
         print(f"Error loading atlas data: {e}")
         return None
+
+def apply_mask_and_whitening(img_data, mask_threshold=0.1, target_pixels=12000):
+    """
+    Apply masking to reduce dimensionality and proper whitening for ICA
+    
+    Parameters:
+    -----------
+    img_data : 4D numpy array
+        fMRI data with shape (x, y, z, time)
+    mask_threshold : float
+        Threshold for creating a brain mask
+    target_pixels : int
+        Target number of pixels after masking
+    
+    Returns:
+    --------
+    whitened_data : 2D numpy array
+        Whitened data with shape (voxels, time)
+    mask : 3D numpy array
+        Binary mask used for dimensionality reduction
+    """
+    # Calculate the mean across time to create a rough brain mask
+    mean_img = np.mean(img_data, axis=3)
+    
+    # Normalize the mean image to [0,1] for easier thresholding
+    norm_mean = (mean_img - np.min(mean_img)) / (np.max(mean_img) - np.min(mean_img))
+    
+    # Create initial mask based on threshold
+    initial_mask = norm_mean > mask_threshold
+    
+    # Count voxels in initial mask
+    initial_voxels = np.sum(initial_mask)
+    print(f"Initial mask contains {initial_voxels} voxels")
+    
+    # Adjust threshold if needed to get closer to target number of pixels
+    if initial_voxels > target_pixels * 1.5:
+        # Too many voxels, increase threshold
+        percentile_value = 100 * (1 - target_pixels / initial_voxels)
+        new_threshold = np.percentile(norm_mean[initial_mask], percentile_value)
+        mask = norm_mean > new_threshold
+    elif initial_voxels < target_pixels * 0.8:
+        # Too few voxels, decrease threshold
+        new_threshold = mask_threshold * 0.8
+        mask = norm_mean > new_threshold
+    else:
+        # Use initial mask
+        mask = initial_mask
+    
+    voxel_count = np.sum(mask)
+    print(f"Final mask contains {voxel_count} voxels")
+    
+    # Reshape 4D data to 2D: (voxels, time)
+    img_shape = img_data.shape
+    reshaped_data = img_data.reshape(-1, img_shape[3])
+    
+    # Apply mask to get only brain voxels
+    mask_flat = mask.reshape(-1)
+    masked_data = reshaped_data[mask_flat, :]  # Shape: (voxels, time)
+    
+    # Center the data (mean=0)
+    centered_data = masked_data - np.mean(masked_data, axis=0)
+    
+    # Proper whitening: make the data have unit variance and decorrelate
+    # First, calculate covariance matrix
+    cov = np.cov(centered_data, rowvar=True)  # Use rowvar=True since data is (voxels, time)
+    
+    # Eigendecomposition of the covariance matrix
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    
+    # Remove any tiny eigenvalues to avoid numerical issues
+    eigenvalues = np.maximum(eigenvalues, 1e-10)
+    
+    # Create whitening matrix: D^(-1/2) * U^T where D is diagonal eigenvalue matrix, U is eigenvector matrix
+    whitening_matrix = np.dot(eigenvectors, np.diag(1.0 / np.sqrt(eigenvalues))) @ eigenvectors.T
+    
+    # Apply whitening transformation
+    whitened_data = whitening_matrix @ centered_data
+    
+    # Verify whitening: covariance should be close to identity matrix
+    whitened_cov = np.cov(whitened_data, rowvar=True)
+    is_whitened = np.allclose(whitened_cov, np.eye(whitened_cov.shape[0]), atol=1e-5)
+    print(f"Data properly whitened: {is_whitened}")
+    
+    return whitened_data, mask
+
+def run_manual_ica(subject_id, n_components=20):
+    """
+    Runs ICA with proper whitening and masking on a single subject
+    """
+    # Construct file path
+    fmri_file = os.path.join(base_dir, f"sub-{subject_id}", "func", "preprocessed",
+                            "mc_func.nii.gz")
+    
+    if not os.path.exists(fmri_file):
+        print(f"fMRI file not found: {fmri_file}")
+        return
+    
+    print(f"Loading fMRI data for subject {subject_id}...")
+    fmri_img = nib.load(fmri_file)
+    fmri_data = fmri_img.get_fdata()
+    
+    print(f"fMRI data shape: {fmri_data.shape}")
+    
+    # Apply masking and whitening
+    print("Applying mask and whitening...")
+    whitened_data, mask = apply_mask_and_whitening(fmri_data, mask_threshold=0.15, target_pixels=12000)
+    
+    print(f"Whitened data shape: {whitened_data.shape}")
+    
+    # Run ICA on whitened data
+    # Important: transpose whitened_data to have samples x features
+    # FastICA expects (samples, features) but our whitened data is (features, samples)
+    print(f"Running FastICA with {n_components} components...")
+    ica = FastICA(n_components=n_components, random_state=42, whiten=False)  # No whitening as we've already done it
+    
+    # Transpose the data to (time, voxels) as FastICA expects (samples, features)
+    sources = ica.fit_transform(whitened_data.T)  # Now sources is (time, components)
+    mixing_matrix = ica.mixing_  # Mixing matrix shape: (n_features, n_components) = (voxels, components)
+    unmixing_matrix = ica.components_  # Unmixing matrix shape: (n_components, n_features) = (components, voxels)
+    
+    print(f"Sources shape: {sources.shape}")
+    print(f"Mixing matrix shape: {mixing_matrix.shape}")
+    print(f"Unmixing matrix shape: {unmixing_matrix.shape}")
+    
+    # Create output directory
+    subject_dir = os.path.join(output_dir, f"sub-{subject_id}")
+    os.makedirs(subject_dir, exist_ok=True)
+    
+    # Save time courses (sources)
+    time_courses_file = os.path.join(subject_dir, "time_courses.npy")
+    np.save(time_courses_file, sources)
+    
+    # Visualize time courses
+    plt.figure(figsize=(12, 20))
+    for i in range(n_components):
+        plt.subplot(n_components, 1, i+1)
+        plt.plot(sources[:, i])
+        plt.title(f"Component {i+1} Time Course")
+        plt.yticks([])
+    plt.tight_layout()
+    plt.savefig(os.path.join(subject_dir, "time_courses.png"), dpi=100)
+    plt.close()
+    
+    # Save the mask
+    mask_file = os.path.join(subject_dir, "brain_mask.nii.gz")
+    mask_img = nib.Nifti1Image(mask.astype(np.int8), fmri_img.affine)
+    nib.save(mask_img, mask_file)
+    
+    # Convert component maps back to 3D space
+    print("Converting component maps to 3D...")
+    
+    # Each column of the mixing matrix corresponds to a spatial map
+    # We can directly use the mixing matrix for the spatial components
+    spatial_maps = mixing_matrix  # Shape: (voxels, components)
+    
+    for i in range(n_components):
+        # Initialize empty volume
+        component_vol = np.zeros(fmri_data.shape[:3])
+        
+        # Get the spatial map for this component
+        component_values = spatial_maps[:, i]
+        
+        # Reshape the mask to 1D for indexing
+        mask_flat = mask.reshape(-1)
+        
+        # Create a volume of zeros
+        component_flat = np.zeros(np.prod(fmri_data.shape[:3]))
+        
+        # Fill the masked voxels with component values
+        component_flat[mask_flat] = component_values
+        
+        # Reshape back to 3D
+        component_vol = component_flat.reshape(fmri_data.shape[:3])
+        
+        # Convert to z-scores for better visualization
+        component_vol = (component_vol - np.mean(component_vol[mask])) / np.std(component_vol[mask])
+        
+        # Save as NIfTI
+        component_file = os.path.join(subject_dir, f"component_{i+1}.nii.gz")
+        component_img = nib.Nifti1Image(component_vol, fmri_img.affine)
+        nib.save(component_img, component_file)
+        
+        # Create a basic visualization of each component
+        plt.figure(figsize=(15, 5))
+        
+        # Get the middle slices
+        x_mid = component_vol.shape[0] // 2
+        y_mid = component_vol.shape[1] // 2
+        z_mid = component_vol.shape[2] // 2
+        
+        # Threshold for visualization
+        threshold = 1.5
+        
+        # Plot three orthogonal views
+        plt.subplot(1, 3, 1)
+        plt.imshow(np.rot90(component_vol[x_mid, :, :]), cmap='RdBu_r', vmin=-3, vmax=3)
+        plt.title(f"Sagittal (X={x_mid})")
+        plt.axis('off')
+        
+        plt.subplot(1, 3, 2)
+        plt.imshow(np.rot90(component_vol[:, y_mid, :]), cmap='RdBu_r', vmin=-3, vmax=3)
+        plt.title(f"Coronal (Y={y_mid})")
+        plt.axis('off')
+        
+        plt.subplot(1, 3, 3)
+        plt.imshow(component_vol[:, :, z_mid], cmap='RdBu_r', vmin=-3, vmax=3)
+        plt.title(f"Axial (Z={z_mid})")
+        plt.axis('off')
+        
+        plt.tight_layout()
+        plt.suptitle(f"Component {i+1}")
+        plt.savefig(os.path.join(subject_dir, f"component_{i+1}_preview.png"), dpi=150)
+        plt.close()
+    
+    print(f"ICA completed for subject {subject_id}")
+    print(f"Results saved to: {subject_dir}")
+    
+    return {
+        'mask': mask,
+        'time_courses': sources,
+        'mixing_matrix': mixing_matrix
+    }
 
 # load ICA components
 def load_ica_components(subject_id):
@@ -326,14 +548,20 @@ def analyze_region_overlap(comp_img, atlas_data, comp_num, output_dir, threshold
     return sorted_regions
 
 def main(subject_id="09"):
-    #load atlas
+    # Run manual ICA with whitening and masking
+    ica_results = run_manual_ica(subject_id, n_components=n_components)
+    if not ica_results:
+        print("Failed to run ICA. Exiting.")
+        return
+    
+    # Load atlas
     print("Loading WHS atlas:")
     atlas_data = load_atlas()
     if not atlas_data:
         print("Failed to load atlas. Exiting.")
         return
     
-    #load ica components
+    # Load ICA components (already saved by run_manual_ica)
     print(f"Loading ICA components for subject {subject_id}...")
     components, time_courses = load_ica_components(subject_id)
     if not components:
